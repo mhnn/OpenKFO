@@ -1,0 +1,62 @@
+# 上游自动同步：每小时（及手动触发）检查上游 ydisk3528/OpenKFO 的 main，
+# 有新提交则同步到本 fork 的 main。
+#
+# 策略：变基（rebase）。本工作流文件必须留在 fork 的默认分支上（GitHub 定时触发
+# 只认默认分支），所以 fork 的 main 恒等于「上游 main 最新 tip + 本工作流这一个提交」，
+# 每次同步把工作流提交重放到上游新 tip 之上，历史保持线性、ahead 恒为 1。
+# - 只重放 fork 独有提交（正常情况下仅本文件这一个），绝不动上游提交内容；
+# - 推送用 --force-with-lease，仅允许改写自己刚变基出来的提交；
+# - 若变基冲突（上游改了同路径文件，几乎不可能）会标红，需人工处理。
+name: Fork Sync
+
+on:
+  schedule:
+    - cron: '17 * * * *' # 每小时一次（UTC，17 分避开整点拥塞）
+  workflow_dispatch: # 支持在 Actions 页手动触发
+
+permissions:
+  contents: write # 允许 GITHUB_TOKEN 推送 main
+
+concurrency:
+  group: fork-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Sync main to upstream (rebase)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/ydisk3528/OpenKFO.git
+          git fetch upstream
+
+          BEFORE=$(git rev-parse origin/main)
+          UPSTREAM=$(git rev-parse refs/remotes/upstream/main)
+
+          if git merge-base --is-ancestor refs/remotes/upstream/main main; then
+            echo "### ✅ 已是最新，无需同步 — main @ ${BEFORE:0:7}（上游 @ ${UPSTREAM:0:7}）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          NEW_COMMITS=$(git log --oneline origin/main..refs/remotes/upstream/main)
+
+          # 把 fork 独有提交（= 本工作流文件）重放到上游新 tip 之上
+          git rebase refs/remotes/upstream/main
+          AFTER=$(git rev-parse main)
+          git push --force-with-lease origin main
+
+          {
+            echo "### 🔁 已同步上游新提交：${BEFORE:0:7} → ${AFTER:0:7}"
+            echo ""
+            echo "$NEW_COMMITS" | head -30 | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
